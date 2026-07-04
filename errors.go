@@ -2,8 +2,6 @@ package cache
 
 import "github.com/Nigel2392/errors"
 
-type errorType int
-
 const (
 	CodeItemNotFound errors.GoCode = "ItemNotFound"
 	CodeInvalidType  errors.GoCode = "InvalidType"
