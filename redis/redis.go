@@ -1,4 +1,4 @@
-package credis
+package redis
 
 import (
 	"context"
@@ -121,7 +121,7 @@ func (c *Cache) TTL(ctx context.Context, key string) cache.Duration {
 	if err != nil || duration < 0 {
 		return 0
 	}
-	return cache.Duration(duration)
+	return duration
 }
 
 // Has returns true if the key exists in the cache.
