@@ -1,7 +1,7 @@
-package cache
+package generational
 
 /*
- 	Package cache provides generational caching utilities to solve the cache invalidation problem.
+ 	Package generational provides generational caching utilities to solve the cache invalidation problem.
 
  	Generational caching allows you to instantly invalidate an entire group of cached items
  	without having to scan or delete individual keys. It works by appending a "generation" integer
@@ -73,7 +73,17 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/Nigel2392/cache"
 )
+
+// minimal required interface for generational caching
+type generationalInterface interface {
+	CounterValue(c context.Context, key string) (int64, error)
+	Increment(c context.Context, key string, amount int64) (int64, error)
+	Expire(c context.Context, key string, ttl time.Duration) error
+}
 
 type GenerationKey = string
 
@@ -119,21 +129,17 @@ func genKeyFn(grp string, gen int64) KeyGenerator {
 	}
 }
 
-func K(s ...string) []string {
-	return s
-}
-
-func GetGenerationFromCache(ctx context.Context, c Cache, group string) (int64, error) {
+func GetGenerationFromCache(ctx context.Context, c generationalInterface, group string) (int64, error) {
 	var v, err = c.CounterValue(ctx, genGroupKey(group))
 	if err != nil {
-		if errors.Is(err, ErrItemNotFound) {
+		if errors.Is(err, cache.ErrItemNotFound) {
 			return 0, nil
 		}
 	}
 	return v, err
 }
 
-func GenerationKeyFromCache(ctx context.Context, c Cache, group string) (KeyGenerator, error) {
+func GenerationKeyFromCache(ctx context.Context, c generationalInterface, group string) (KeyGenerator, error) {
 	var gen, err = GetGenerationFromCache(ctx, c, group)
 	if err != nil {
 		return nil, err
@@ -144,7 +150,7 @@ func GenerationKeyFromCache(ctx context.Context, c Cache, group string) (KeyGene
 
 // RollOverFromCache increments the generation key in the
 // It also returns a GenerationKey.
-func RollOverFromCache(ctx context.Context, c Cache, group string, ttl Duration) (KeyGenerator, error) {
+func RollOverFromCache(ctx context.Context, c generationalInterface, group string, ttl time.Duration) (KeyGenerator, error) {
 	groupKey := genGroupKey(group)
 	gen, err := c.Increment(ctx, groupKey, 1)
 	if err != nil {
@@ -160,7 +166,7 @@ func RollOverFromCache(ctx context.Context, c Cache, group string, ttl Duration)
 	return genKeyFn(group, gen), nil
 }
 
-func GetItemFromCache[T any](ctx context.Context, c Cache, ttl Duration, gen int64, group string, key []string, get func(context.Context) (T, error)) (result T, err error) {
+func GetItemFromCache[T1, T2 any](ctx context.Context, c cache.TypedCache[T1], ttl time.Duration, gen int64, group string, key []string, get func(context.Context) (T2, error)) (result T2, err error) {
 	if gen == -1 {
 		gen, err = GetGenerationFromCache(ctx, c, group)
 		if err != nil {
@@ -169,8 +175,8 @@ func GetItemFromCache[T any](ctx context.Context, c Cache, ttl Duration, gen int
 	}
 
 	var cacheKey = genKey(group, gen, key)
-	v, err := Get(ctx, cacheKey)
-	isNotFound := errors.Is(err, ErrItemNotFound)
+	v, err := cache.Get(ctx, cacheKey)
+	isNotFound := errors.Is(err, cache.ErrItemNotFound)
 	if err != nil && !isNotFound {
 		return result, err
 	}
@@ -181,31 +187,31 @@ func GetItemFromCache[T any](ctx context.Context, c Cache, ttl Duration, gen int
 			return result, err
 		}
 
-		err = c.Set(ctx, cacheKey, result, ttl)
+		err = c.Set(ctx, cacheKey, any(result).(T1), ttl)
 		return result, err
 	}
 
-	result, ok := v.(T)
+	result, ok := v.(T2)
 	if !ok {
-		return result, ErrInvalidType
+		return result, cache.ErrInvalidType
 	}
 	return result, nil
 }
 
 func GetGen(ctx context.Context, group string) (int64, error) {
-	return GetGenerationFromCache(ctx, Default(), group)
+	return GetGenerationFromCache(ctx, cache.Default(), group)
 }
 
 func GetKey(ctx context.Context, group string, key ...string) (KeyGenerator, error) {
-	return GenerationKeyFromCache(ctx, Default(), group)
+	return GenerationKeyFromCache(ctx, cache.Default(), group)
 }
 
-// RollOverFromCache increments the generation key in the
+// RollOver increments the generation key in the
 // It also returns a GenerationKey generator.
-func RollOver(ctx context.Context, group string, ttl Duration) (KeyGenerator, error) {
-	return RollOverFromCache(ctx, Default(), group, ttl)
+func RollOver(ctx context.Context, group string, ttl time.Duration) (KeyGenerator, error) {
+	return RollOverFromCache(ctx, cache.Default(), group, ttl)
 }
 
-func GetItem[T any](ctx context.Context, ttl Duration, gen int64, group string, key []string, get func(context.Context) (T, error)) (result T, err error) {
-	return GetItemFromCache(ctx, Default(), ttl, gen, group, key, get)
+func GetItem[T any](ctx context.Context, ttl time.Duration, gen int64, group string, key []string, get func(context.Context) (T, error)) (result T, err error) {
+	return GetItemFromCache(ctx, cache.Default(), ttl, gen, group, key, get)
 }

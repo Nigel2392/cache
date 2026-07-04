@@ -6,10 +6,12 @@ import (
 	"time"
 
 	"github.com/Nigel2392/cache"
+	"github.com/Nigel2392/cache/buffer"
+	"github.com/Nigel2392/cache/internal"
 	"github.com/redis/go-redis/v9"
 )
 
-var _ cache.Cache = (*Cache)(nil)
+var _ cache.TransactionalCache = (*Cache)(nil)
 
 // Cache wraps a go-redis UniversalClient.
 // Using redis.UniversalClient allows the user to pass in a standard *redis.Client,
@@ -69,7 +71,7 @@ func (c *Cache) GetDefault(ctx context.Context, key string, defaultValue interfa
 // The value will expire after the specified ttl.
 //
 // If the TTL is 0, or Infinity, the value will never expire.
-func (c *Cache) Set(ctx context.Context, key string, value interface{}, ttl cache.Duration) error {
+func (c *Cache) Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error {
 	return c.Client.Set(ctx, key, value, time.Duration(ttl)).Err()
 }
 
@@ -99,7 +101,7 @@ func (c *Cache) CounterValue(ctx context.Context, key string) (int64, error) {
 
 // Expire sets the TTL for a given key.
 // If the key does not exist in the cache, [ErrItemNotFound] is returned.
-func (c *Cache) Expire(ctx context.Context, key string, ttl cache.Duration) error {
+func (c *Cache) Expire(ctx context.Context, key string, ttl time.Duration) error {
 	ok, err := c.Client.Expire(ctx, key, time.Duration(ttl)).Result()
 	if err != nil {
 		return err
@@ -115,7 +117,7 @@ func (c *Cache) Expire(ctx context.Context, key string, ttl cache.Duration) erro
 // If the key does not exist, TTL returns 0.
 //
 // If any error occurs, TTL returns 0.
-func (c *Cache) TTL(ctx context.Context, key string) cache.Duration {
+func (c *Cache) TTL(ctx context.Context, key string) time.Duration {
 	duration, err := c.Client.TTL(ctx, key).Result()
 	// Redis returns -2 for non-existent keys and -1 for keys with no expiry.
 	if err != nil || duration < 0 {
@@ -170,4 +172,32 @@ func (c *Cache) Close(ctx context.Context) error {
 		return c.Client.Close()
 	}
 	return nil
+}
+
+func (c *Cache) RunInTx(ctx context.Context, fn func(ctx context.Context, txCache internal.TypedTransaction[any]) error) error {
+	buf := buffer.NewCacheBuffer[any](c)
+
+	if err := fn(ctx, buf); err != nil {
+		return err // Rollback
+	}
+
+	pendingOps, cleared := buf.Flush()
+
+	_, err := c.Client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		if cleared {
+			pipe.FlushDB(ctx)
+		}
+
+		for key, item := range pendingOps {
+			switch item.Op {
+			case cache.OP_SET:
+				pipe.Set(ctx, key, item.Value, item.TTL)
+			case cache.OP_DEL:
+				pipe.Del(ctx, key)
+			}
+		}
+		return nil
+	})
+
+	return err
 }

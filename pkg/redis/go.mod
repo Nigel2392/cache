@@ -1,4 +1,4 @@
-module github.com/Nigel2392/cache/credis
+module github.com/Nigel2392/cache/pkg/credis
 
 go 1.26.3
 

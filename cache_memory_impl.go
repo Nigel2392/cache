@@ -4,6 +4,9 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/Nigel2392/cache/buffer"
+	"github.com/Nigel2392/cache/internal"
 )
 
 func init() {
@@ -12,11 +15,10 @@ func init() {
 	)
 }
 
-var _ Cache = (*MemoryCache[any])(nil)
-var _ TransactionalCache = (*MemoryCache[any])(nil)
-var _ Transaction = (*localTx[any])(nil)
-
-const Infinity = Duration(1<<63 - 1) // 290 years
+var (
+	_ Cache              = (*MemoryCache[any])(nil)
+	_ TransactionalCache = (*MemoryCache[any])(nil)
+)
 
 type memitem struct {
 	key      string
@@ -304,230 +306,38 @@ func (c *MemoryCache[T]) work() {
 	}
 }
 
-// A local wrapper to track what happens during the transaction
-type txItem[T any] struct {
-	memitem
-	updated bool
-	deleted bool
-}
+func (c *MemoryCache[T]) RunInTx(ctx context.Context, fn func(ctx context.Context, txCache internal.TypedTransaction[T]) error) error {
+	buf := buffer.NewCacheBuffer(c)
 
-// localTx implements TypedCache[T] for the duration of the transaction
-type localTx[T any] struct {
-	state         map[string]*txItem[T]
-	cleared       bool
-	inTransaction bool
-}
-
-func (c *MemoryCache[T]) RunInTx(ctx context.Context, fn func(ctx context.Context, txCache TypedTransaction[T]) error) error {
-	// copy the cache, but wrap it in our state tracker.
-	txMap := make(map[string]*txItem[T])
-
-	// this function is not meant for high throughput production environments
-	// or environments with very big caches.
-	c.mu.Lock()
-	for k, v := range c.cache {
-		txMap[k] = &txItem[T]{
-			memitem: *v,
-			updated: false,
-			deleted: false,
-		}
+	if err := fn(ctx, buf); err != nil {
+		return err
 	}
-	c.mu.Unlock()
 
-	// Execute provided func in transaction
-	tx := &localTx[T]{state: txMap, inTransaction: true}
-	if err := fn(ctx, tx); err != nil {
-		return err // discard the map on error
-	}
-	tx.inTransaction = false
+	pendingOps, cleared := buf.Flush()
 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	// committing, only applying diffs
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if tx.cleared {
+	if cleared {
 		c.cache = make(map[string]*memitem)
 	}
 
-	for k, item := range txMap {
-		if tx.cleared && item.updated && !item.deleted {
-			// If cleared, ONLY apply items that were explicitly Set() AFTER the Clear()
+	for k, item := range pendingOps {
+		switch item.Op {
+		case OP_SET:
 			c.cache[k] = &memitem{
 				key:      k,
-				value:    item.value,
-				lifeTime: item.lifeTime,
+				value:    item.Value,
+				lifeTime: item.LifeTime,
 			}
-		} else if !tx.cleared {
-			// Normal diff logic
-			if item.deleted {
-				delete(c.cache, k)
-			} else if item.updated {
-				c.cache[k] = &memitem{
-					key:      k,
-					value:    item.value,
-					lifeTime: item.lifeTime,
-				}
-			}
-		}
-		// If not cleared, deleted or updated, do nothing.
-		// preserves changes made by other goroutines.
-	}
-
-	return nil
-}
-
-func (tx *localTx[T]) InTransaction() bool {
-	return tx.inTransaction
-}
-
-func (tx *localTx[T]) Expire(_ context.Context, key string, ttl time.Duration) error {
-	item, ok := tx.state[key]
-
-	if !ok || item.deleted || item.expired() {
-		return ErrItemNotFound
-	}
-
-	ttl = GetDefaultTTL(ttl)
-	item.lifeTime = time.Now().Add(ttl)
-	item.updated = true
-
-	return nil
-}
-
-func (tx *localTx[T]) Increment(_ context.Context, key string, amount int64) (int64, error) {
-	item, ok := tx.state[key]
-
-	if !ok || item.deleted || item.expired() {
-		tx.state[key] = &txItem[T]{
-			memitem: memitem{
-				key:      key,
-				value:    amount,
-				lifeTime: time.Now().Add(Infinity),
-			},
-			updated: true,
-			deleted: false,
-		}
-		return amount, nil
-	}
-
-	currentVal, ok := item.value.(int64)
-	if !ok {
-		return 0, ErrInvalidType
-	}
-
-	newVal := currentVal + amount
-	item.value = newVal
-	item.updated = true
-	item.deleted = false
-
-	return newVal, nil
-}
-
-func (tx *localTx[T]) Decrement(ctx context.Context, key string, amount int64) (int64, error) {
-	return tx.Increment(ctx, key, -amount)
-}
-
-func (tx *localTx[T]) CounterValue(ctx context.Context, key string) (int64, error) {
-	item, ok := tx.state[key]
-	if !ok || item.deleted || item.expired() {
-		return 0, ErrItemNotFound
-	}
-
-	currentVal, ok := item.value.(int64)
-	if !ok {
-		return 0, ErrInvalidType
-	}
-
-	return currentVal, nil
-}
-
-func (tx *localTx[T]) Set(_ context.Context, key string, value T, ttl time.Duration) error {
-	ttl = GetDefaultTTL(ttl)
-	tx.state[key] = &txItem[T]{
-		memitem: memitem{
-			key:      key,
-			value:    value,
-			lifeTime: time.Now().Add(ttl),
-		},
-		updated: true,
-		deleted: false,
-	}
-	return nil
-}
-
-func (tx *localTx[T]) Delete(_ context.Context, key string) error {
-	if item, ok := tx.state[key]; ok {
-		item.deleted = true
-		item.updated = false
-	} else {
-		tx.state[key] = &txItem[T]{deleted: true}
-	}
-	return nil
-}
-
-func (tx *localTx[T]) Get(_ context.Context, key string) (value T, err error) {
-	item, ok := tx.state[key]
-	// Now we check .expired() so the Tx respects time!
-	if !ok || item.deleted || item.expired() {
-		return value, ErrItemNotFound
-	}
-	t, ok := item.value.(T)
-	if !ok {
-		return *new(T), ErrInvalidType
-	}
-	return t, nil
-}
-
-func (tx *localTx[T]) Has(_ context.Context, key string) bool {
-	item, ok := tx.state[key]
-	return ok && !item.deleted && !item.expired()
-}
-
-func (tx *localTx[T]) GetDefault(_ context.Context, key string, defaultValue T) (T, error) {
-	item, ok := tx.state[key]
-	if !ok || item.deleted || item.expired() {
-		return defaultValue, nil
-	}
-	t, ok := item.value.(T)
-	if !ok {
-		return *new(T), ErrInvalidType
-	}
-	return t, nil
-}
-
-func (tx *localTx[T]) Keys(_ context.Context) ([]string, error) {
-	var keys = make([]string, 0, len(tx.state))
-	for k, item := range tx.state {
-		// Only return keys that are alive and not deleted
-		if !item.deleted && !item.expired() {
-			keys = append(keys, k)
+		case OP_DEL:
+			delete(c.cache, k)
 		}
 	}
-	return keys, nil
-}
 
-func (tx *localTx[T]) Clear(_ context.Context) error {
-	tx.cleared = true
-	for _, item := range tx.state {
-		item.deleted = true
-		item.updated = false
-	}
-	return nil
-}
-
-func (tx *localTx[T]) TTL(_ context.Context, key string) time.Duration {
-	item, ok := tx.state[key]
-	if !ok || item.deleted || item.expired() {
-		return 0
-	}
-	// Dynamically calculate the remaining time based on the exact moment TTL is called
-	return time.Until(item.lifeTime)
-}
-
-func (tx *localTx[T]) Close(_ context.Context) error {
 	return nil
 }

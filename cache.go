@@ -3,20 +3,22 @@ package cache
 import (
 	"context"
 	"time"
+
+	"github.com/Nigel2392/cache/internal"
 )
 
 const (
 	DefaultCache = "default"
+	Infinity     = internal.Infinity
 )
 
-var GetDefaultTTL = func(provided Duration) Duration {
-	if provided > 0 {
-		return provided
-	}
-	return time.Hour
+func GetDefaultTTL(provided time.Duration) time.Duration {
+	return internal.GetDefaultTTL(provided)
 }
 
-type Duration = time.Duration
+func SetGetDefaultTTL(fn func(provided time.Duration) time.Duration) {
+	internal.GetDefaultTTL = fn
+}
 
 type cacheBackend struct {
 	backends map[string]TransactionalCache
@@ -101,7 +103,7 @@ func GetDefault(ctx context.Context, key string, defaultValue interface{}) (inte
 // The value will expire after the specified ttl.
 //
 // If a transaction is active in the context, it will be called on the transaction instead.
-func Set(ctx context.Context, key string, value interface{}, ttl Duration) error {
+func Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error {
 	return transactionOrDefault(ctx).Set(ctx, key, value, ttl)
 }
 
@@ -121,7 +123,7 @@ func Decrement(ctx context.Context, key string, amount int64) (int64, error) {
 
 // Expire sets the TTL for a given key.
 // If the key does not exist in the cache, [ErrItemNotFound] is returned.
-func Expire(ctx context.Context, key string, ttl Duration) error {
+func Expire(ctx context.Context, key string, ttl time.Duration) error {
 	return transactionOrDefault(ctx).Expire(ctx, key, ttl)
 }
 
@@ -138,7 +140,7 @@ func CounterValue(ctx context.Context, key string) (int64, error) {
 // If any error occurs, TTL returns 0.
 //
 // If a transaction is active in the context, it will be called on the transaction instead.
-func TTL(ctx context.Context, key string) Duration {
+func TTL(ctx context.Context, key string) time.Duration {
 	return transactionOrDefault(ctx).TTL(ctx, key)
 }
 

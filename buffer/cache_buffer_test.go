@@ -1,4 +1,4 @@
-package cache_test
+package buffer_test
 
 import (
 	"context"
